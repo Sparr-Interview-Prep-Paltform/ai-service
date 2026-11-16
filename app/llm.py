@@ -1,13 +1,19 @@
-
 import os
 import json
+import logging
+
+from copy import deepcopy
 
 from google import genai
 from google.genai import types
+from groq import Groq
+
 from dotenv import load_dotenv
-from copy import deepcopy
+from types import SimpleNamespace
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 
 # --------------------------------------------------
@@ -19,10 +25,16 @@ MODEL = os.getenv(
     "gemini-3.5-flash-lite"
 )
 
+GROQ_MODEL = os.getenv(
+    "GROQ_MODEL",
+    "openai/gpt-oss-20b"
+)
+
 MAX_OUTPUT_TOKENS = 4000
 REQUEST_TIMEOUT_MS = 60000
 
 _client = None
+_groq_client = None
 
 
 # --------------------------------------------------
@@ -32,8 +44,6 @@ _client = None
 def get_client():
     """
     Create the Gemini client only when needed.
-    This allows the application to start even
-    when the API key is not configured.
     """
 
     global _client
@@ -59,13 +69,42 @@ def get_client():
 
 
 # --------------------------------------------------
+# Groq client
+# --------------------------------------------------
+
+def get_groq_client():
+    """
+    Create the Groq client only when needed.
+    """
+
+    global _groq_client
+
+    if _groq_client is not None:
+        return _groq_client
+
+    api_key = os.getenv("GROQ_API_KEY")
+
+    if not api_key:
+        raise RuntimeError(
+            "GROQ_API_KEY is not configured"
+        )
+
+    _groq_client = Groq(
+        api_key=api_key,
+        timeout=REQUEST_TIMEOUT_MS / 1000,
+        max_retries=0,
+    )
+
+    return _groq_client
+
+
+# --------------------------------------------------
 # Response schema preparation
 # --------------------------------------------------
 
 def _prepare_response_schema(response_schema):
     """
-    Prepare a Pydantic model or JSON schema
-    for the legacy Gemini response_schema parameter.
+    Prepare a Pydantic model or JSON schema.
 
     Resolve internal references and remove
     additionalProperties recursively.
@@ -135,6 +174,53 @@ def _prepare_response_schema(response_schema):
 
 
 # --------------------------------------------------
+# Groq schema preparation
+# --------------------------------------------------
+
+def _prepare_groq_schema(response_schema):
+    """
+    Convert the existing schema into standard
+    JSON Schema format accepted by Groq.
+    """
+
+    schema = _prepare_response_schema(response_schema)
+
+    def normalize(value):
+
+        if isinstance(value, dict):
+            normalized = {}
+
+            for key, nested_value in value.items():
+
+                if key in ("title", "default", "examples"):
+                    continue
+
+                if key == "type" and isinstance(nested_value, str):
+                    normalized[key] = nested_value.lower()
+
+                elif key == "type" and isinstance(nested_value, list):
+                    normalized[key] = [
+                        item.lower() if isinstance(item, str) else item
+                        for item in nested_value
+                    ]
+
+                else:
+                    normalized[key] = normalize(nested_value)
+
+            return normalized
+
+        if isinstance(value, list):
+            return [
+                normalize(item)
+                for item in value
+            ]
+
+        return value
+
+    return normalize(schema)
+
+
+# --------------------------------------------------
 # Skill extraction JSON schemas
 # --------------------------------------------------
 
@@ -151,11 +237,7 @@ SKILL_CATEGORIES = [
 
 def _build_skills_schema(score_field):
     """
-    Build a simple JSON schema for Gemini skill extraction.
-
-    score_field can be:
-    - confidence_score
-    - importance
+    Build a simple JSON schema for skill extraction.
     """
 
     return {
@@ -192,39 +274,72 @@ def _build_skills_schema(score_field):
 
 
 def build_resume_skills_schema():
-    """
-    Build the JSON schema used when extracting
-    skills from a resume.
-    """
-
     return _build_skills_schema("confidence_score")
 
 
 def build_job_skills_schema():
+    return _build_skills_schema("importance")
+
+
+# --------------------------------------------------
+# Temporary error detection
+# --------------------------------------------------
+
+def _is_temporary_error(error):
     """
-    Build the JSON schema used when extracting
-    skills from a job description.
+    Detect temporary provider errors that may justify
+    switching from Gemini to Groq.
+
+    Do not switch for schema, prompt, or validation errors.
     """
 
-    return _build_skills_schema("importance")
+    status_code = (
+        getattr(error, "status_code", None)
+        or getattr(error, "code", None)
+    )
+
+    if status_code in (408, 429, 500, 502, 503, 504):
+        return True
+
+    error_name = type(error).__name__.lower()
+    error_message = str(error).lower()
+
+    temporary_names = (
+        "timeout",
+        "connectionerror",
+        "servererror",
+    )
+
+    if any(name in error_name for name in temporary_names):
+        return True
+
+    temporary_messages = (
+        "resource_exhausted",
+        "service unavailable",
+        "temporarily unavailable",
+        "deadline exceeded",
+        "timed out",
+        "connection reset",
+    )
+
+    return any(
+        message in error_message
+        for message in temporary_messages
+    )
 
 
 # --------------------------------------------------
 # Gemini request
 # --------------------------------------------------
 
-def _generate_response(
+def _generate_with_gemini(
     system_prompt,
     user_message,
     json_mode=False,
     response_schema=None,
 ):
     """
-    Send a generation request to Gemini.
-
-    response_schema can be:
-    - A dictionary containing a raw JSON schema.
-    - A Pydantic model used by the existing workflows.
+    Generate a response using Gemini.
     """
 
     config_options = {
@@ -239,15 +354,11 @@ def _generate_response(
         )
 
         if isinstance(response_schema, dict):
-            # Use response_json_schema for manually
-            # defined JSON schemas.
             config_options["response_json_schema"] = (
                 response_schema
             )
 
         elif response_schema is not None:
-            # Preserve the existing Pydantic schema path
-            # used by the other application workflows.
             config_options["response_schema"] = (
                 _prepare_response_schema(response_schema)
             )
@@ -269,12 +380,129 @@ def _generate_response(
 
 
 # --------------------------------------------------
+# Groq request
+# --------------------------------------------------
+
+def _generate_with_groq(
+    system_prompt,
+    user_message,
+    json_mode=False,
+    response_schema=None,
+):
+    """
+    Generate a response using Groq as a fallback.
+    """
+
+    request_options = {
+        "model": GROQ_MODEL,
+        "messages": [
+            {
+                "role": "system",
+                "content": system_prompt,
+            },
+            {
+                "role": "user",
+                "content": user_message,
+            },
+        ],
+        "max_completion_tokens": MAX_OUTPUT_TOKENS,
+        "temperature": 0,
+    }
+
+    if json_mode:
+
+        if response_schema is not None:
+            groq_schema = _prepare_groq_schema(
+                response_schema
+            )
+
+            request_options["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "ai_response",
+                    "strict": False,
+                    "schema": groq_schema,
+                },
+            }
+
+        else:
+            request_options["response_format"] = {
+                "type": "json_object",
+            }
+
+    elif response_schema is not None:
+        raise ValueError(
+            "response_schema requires json_mode=True"
+        )
+
+    response = get_groq_client().chat.completions.create(
+        **request_options
+    )
+
+    return SimpleNamespace(
+    text=response.choices[0].message.content
+    )
+
+
+# --------------------------------------------------
+# Main generation with fallback
+# --------------------------------------------------
+
+def _generate_response(
+    system_prompt,
+    user_message,
+    json_mode=False,
+    response_schema=None,
+):
+    """
+    Try Gemini first.
+
+    If Gemini fails due to a temporary error,
+    switch to Groq.
+    """
+
+    try:
+        return _generate_with_gemini(
+            system_prompt,
+            user_message,
+            json_mode=json_mode,
+            response_schema=response_schema,
+        )
+
+    except Exception as error:
+
+        if not _is_temporary_error(error):
+            raise
+
+        logger.warning(
+            "Gemini temporary failure (%s). "
+            "Switching to Groq model '%s'.",
+            type(error).__name__,
+            GROQ_MODEL,
+        )
+
+        try:
+            return _generate_with_groq(
+                system_prompt,
+                user_message,
+                json_mode=json_mode,
+                response_schema=response_schema,
+            )
+
+        except Exception:
+            logger.exception(
+                "Groq fallback failed."
+            )
+            raise
+
+
+# --------------------------------------------------
 # Text response
 # --------------------------------------------------
 
 def ask_llm(system_prompt, user_message):
     """
-    Generate a regular text response from Gemini.
+    Generate a regular text response.
     """
 
     response = _generate_response(
@@ -286,7 +514,7 @@ def ask_llm(system_prompt, user_message):
 
     if not response_text:
         raise ValueError(
-            "Gemini returned an empty response"
+            "AI provider returned an empty response"
         )
 
     return response_text
@@ -304,8 +532,8 @@ def ask_llm_json(
     """
     Generate and parse a JSON response.
 
-    No retry is performed.
-    Invalid or empty responses raise an error immediately.
+    Gemini is the primary provider.
+    Groq is used only after a temporary Gemini failure.
     """
 
     response = _generate_response(
@@ -319,7 +547,7 @@ def ask_llm_json(
 
     if not response_text:
         raise ValueError(
-            "Gemini returned an empty response"
+            "AI provider returned an empty response"
         )
 
     try:
@@ -327,12 +555,12 @@ def ask_llm_json(
 
     except json.JSONDecodeError as error:
         raise ValueError(
-            f"Gemini returned invalid JSON: {error}"
+            f"AI provider returned invalid JSON: {error}"
         ) from error
 
     if not isinstance(result, dict):
         raise ValueError(
-            "Gemini JSON response must be an object"
+            "AI JSON response must be an object"
         )
 
     return result

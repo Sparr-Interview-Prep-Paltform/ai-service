@@ -19,6 +19,7 @@ Which skills to include:
 _JOB_INTRO = """
 You are an expert technical recruiter assistant.
 Extract technical skills from the job posting provided inside <job> tags, and rate how important each skill is for the job.
+- Do NOT extract generic job roles or broad development areas as skills (for example "backend", "frontend", "full stack", "backend development", "frontend development", "software development"). Extract the specific technologies and technical concepts required for that area instead.
 
 Which skills to include:
 - Include every technical skill the job requires or prefers, including nice-to-have ones, from every part of the posting: the title, summary, responsibilities, requirements, and nice-to-have sections.
@@ -134,6 +135,17 @@ ADDITIONAL RULES:
 - Within each range, consider the number of mentions and the
   amount of supporting detail. Do not reward repetition alone.
 - Use at most two decimal places.
+Do not include job titles, job roles, or job positions
+as skills.
+
+Examples of items that must NOT be extracted:
+- Backend Developer
+- Software Engineer
+- Senior Python Developer
+- Full Stack Developer
+
+Extract only actual technical skills, technologies,
+tools, frameworks, databases, and competencies.
 """
 
 
