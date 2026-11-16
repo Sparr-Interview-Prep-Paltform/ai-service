@@ -1,15 +1,16 @@
+
 import os
 import json
 import logging
 
 from copy import deepcopy
+from types import SimpleNamespace
 
 from google import genai
 from google.genai import types
-from groq import Groq
+from anthropic import Anthropic
 
 from dotenv import load_dotenv
-from types import SimpleNamespace
 
 load_dotenv()
 
@@ -25,16 +26,16 @@ MODEL = os.getenv(
     "gemini-3.5-flash-lite"
 )
 
-GROQ_MODEL = os.getenv(
-    "GROQ_MODEL",
-    "openai/gpt-oss-20b"
+CLAUDE_MODEL = os.getenv(
+    "CLAUDE_MODEL",
+    "claude-sonnet-5-5"
 )
 
 MAX_OUTPUT_TOKENS = 4000
 REQUEST_TIMEOUT_MS = 60000
 
 _client = None
-_groq_client = None
+_claude_client = None
 
 
 # --------------------------------------------------
@@ -69,33 +70,33 @@ def get_client():
 
 
 # --------------------------------------------------
-# Groq client
+# Claude client
 # --------------------------------------------------
 
-def get_groq_client():
+def get_claude_client():
     """
-    Create the Groq client only when needed.
+    Create the Claude client only when needed.
     """
 
-    global _groq_client
+    global _claude_client
 
-    if _groq_client is not None:
-        return _groq_client
+    if _claude_client is not None:
+        return _claude_client
 
-    api_key = os.getenv("GROQ_API_KEY")
+    api_key = os.getenv("ANTHROPIC_API_KEY")
 
     if not api_key:
         raise RuntimeError(
-            "GROQ_API_KEY is not configured"
+            "ANTHROPIC_API_KEY is not configured"
         )
 
-    _groq_client = Groq(
+    _claude_client = Anthropic(
         api_key=api_key,
         timeout=REQUEST_TIMEOUT_MS / 1000,
         max_retries=0,
     )
 
-    return _groq_client
+    return _claude_client
 
 
 # --------------------------------------------------
@@ -174,25 +175,41 @@ def _prepare_response_schema(response_schema):
 
 
 # --------------------------------------------------
-# Groq schema preparation
+# Claude schema preparation
 # --------------------------------------------------
 
-def _prepare_groq_schema(response_schema):
+def _prepare_claude_schema(response_schema):
     """
-    Convert the existing schema into standard
-    JSON Schema format accepted by Groq.
+    Convert the existing schema into a format
+    supported by Claude structured outputs.
     """
 
     schema = _prepare_response_schema(response_schema)
 
+    unsupported_constraints = (
+        "title",
+        "default",
+        "examples",
+        "minimum",
+        "maximum",
+        "exclusiveMinimum",
+        "exclusiveMaximum",
+        "multipleOf",
+        "minLength",
+        "maxLength",
+        "minItems",
+        "maxItems",
+    )
+
     def normalize(value):
 
         if isinstance(value, dict):
+
             normalized = {}
 
             for key, nested_value in value.items():
 
-                if key in ("title", "default", "examples"):
+                if key in unsupported_constraints:
                     continue
 
                 if key == "type" and isinstance(nested_value, str):
@@ -206,6 +223,9 @@ def _prepare_groq_schema(response_schema):
 
                 else:
                     normalized[key] = normalize(nested_value)
+
+            if normalized.get("type") == "object":
+                normalized["additionalProperties"] = False
 
             return normalized
 
@@ -288,9 +308,10 @@ def build_job_skills_schema():
 def _is_temporary_error(error):
     """
     Detect temporary provider errors that may justify
-    switching from Gemini to Groq.
+    switching from Gemini to Claude.
 
-    Do not switch for schema, prompt, or validation errors.
+    Do not switch for authentication, schema,
+    prompt, or validation errors.
     """
 
     status_code = (
@@ -298,7 +319,7 @@ def _is_temporary_error(error):
         or getattr(error, "code", None)
     )
 
-    if status_code in (408, 429, 500, 502, 503, 504):
+    if status_code in (408, 429, 500, 502, 503, 504, 529):
         return True
 
     error_name = type(error).__name__.lower()
@@ -320,6 +341,8 @@ def _is_temporary_error(error):
         "deadline exceeded",
         "timed out",
         "connection reset",
+        "overloaded_error",
+        "rate_limit_error",
     )
 
     return any(
@@ -380,68 +403,57 @@ def _generate_with_gemini(
 
 
 # --------------------------------------------------
-# Groq request
+# Claude request
 # --------------------------------------------------
 
-def _generate_with_groq(
+def _generate_with_claude(
     system_prompt,
     user_message,
     json_mode=False,
     response_schema=None,
 ):
     """
-    Generate a response using Groq as a fallback.
+    Generate a response using Claude as a fallback.
     """
 
     request_options = {
-        "model": GROQ_MODEL,
+        "model": CLAUDE_MODEL,
+        "max_tokens": MAX_OUTPUT_TOKENS,
+        "system": system_prompt,
         "messages": [
-            {
-                "role": "system",
-                "content": system_prompt,
-            },
             {
                 "role": "user",
                 "content": user_message,
-            },
+            }
         ],
-        "max_completion_tokens": MAX_OUTPUT_TOKENS,
-        "temperature": 0,
     }
 
-    if json_mode:
-
-        if response_schema is not None:
-            groq_schema = _prepare_groq_schema(
-                response_schema
-            )
-
-            request_options["response_format"] = {
+    if json_mode and response_schema is not None:
+        request_options["output_config"] = {
+            "format": {
                 "type": "json_schema",
-                "json_schema": {
-                    "name": "ai_response",
-                    "strict": False,
-                    "schema": groq_schema,
-                },
+                "schema": _prepare_claude_schema(
+                    response_schema
+                ),
             }
-
-        else:
-            request_options["response_format"] = {
-                "type": "json_object",
-            }
+        }
 
     elif response_schema is not None:
         raise ValueError(
             "response_schema requires json_mode=True"
         )
 
-    response = get_groq_client().chat.completions.create(
+    response = get_claude_client().messages.create(
         **request_options
     )
 
-    return SimpleNamespace(
-    text=response.choices[0].message.content
+    response_text = "".join(
+        block.text
+        for block in response.content
+        if block.type == "text"
     )
+
+    return SimpleNamespace(text=response_text)
 
 
 # --------------------------------------------------
@@ -458,7 +470,7 @@ def _generate_response(
     Try Gemini first.
 
     If Gemini fails due to a temporary error,
-    switch to Groq.
+    switch to Claude.
     """
 
     try:
@@ -476,13 +488,13 @@ def _generate_response(
 
         logger.warning(
             "Gemini temporary failure (%s). "
-            "Switching to Groq model '%s'.",
+            "Switching to Claude model '%s'.",
             type(error).__name__,
-            GROQ_MODEL,
+            CLAUDE_MODEL,
         )
 
         try:
-            return _generate_with_groq(
+            return _generate_with_claude(
                 system_prompt,
                 user_message,
                 json_mode=json_mode,
@@ -491,7 +503,7 @@ def _generate_response(
 
         except Exception:
             logger.exception(
-                "Groq fallback failed."
+                "Claude fallback failed."
             )
             raise
 
@@ -533,7 +545,7 @@ def ask_llm_json(
     Generate and parse a JSON response.
 
     Gemini is the primary provider.
-    Groq is used only after a temporary Gemini failure.
+    Claude is used only after a temporary Gemini failure.
     """
 
     response = _generate_response(
