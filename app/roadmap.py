@@ -4,9 +4,10 @@ from app.llm import ask_llm_json
 from app.resources import get_resources
 from prompts.generate_roadmap import GENERATE_ROADMAP_PROMPT
 
-MAX_STEPS = 6
-MAX_TOPICS = 5
-MIN_TOPICS = 3
+
+MAX_STEPS = 4
+MAX_TOPICS = 3
+MIN_TOPICS = 2
 
 
 def _to_float(value, default=0.0):
@@ -22,6 +23,17 @@ def sort_skills(skills):
         key=lambda skill: _to_float(skill.get("importance")),
         reverse=True,
     )
+
+
+def _get_required_steps(importance):
+    importance = _to_float(importance)
+
+    if importance >= 0.8:
+        return MAX_STEPS
+    elif importance >= 0.5:
+        return 3
+
+    return 2
 
 
 def _clean_topics(value):
@@ -45,7 +57,12 @@ def _clean_topics(value):
     return topics
 
 
-def build_message(job_title, known_skills, skill, other_missing_skills=None):
+def build_message(
+    job_title,
+    known_skills,
+    skill,
+    other_missing_skills=None,
+):
     known = ", ".join(known_skills) if known_skills else "(none)"
 
     other_missing = (
@@ -54,16 +71,25 @@ def build_message(job_title, known_skills, skill, other_missing_skills=None):
         else "(none)"
     )
 
+    required_steps = _get_required_steps(
+        skill.get("importance")
+    )
+
     return (
-    f"<job_title>\n{job_title}\n</job_title>\n"
-    f"<known_skills>\n{known}\n</known_skills>\n"
-    f"<other_missing_skills>\n{other_missing}\n</other_missing_skills>\n"
-    f"<skill>\n"
-    f"name: {skill['name']}\n"
-    f"category: {skill.get('category', 'other')}\n"
-    f"importance: {skill.get('importance')}\n"
-    f"</skill>"
-)
+        f"<job_title>\n{job_title}\n</job_title>\n"
+        f"<known_skills>\n{known}\n</known_skills>\n"
+        f"<other_missing_skills>\n"
+        f"{other_missing}\n"
+        f"</other_missing_skills>\n"
+        f"<required_steps>\n"
+        f"{required_steps}\n"
+        f"</required_steps>\n"
+        f"<skill>\n"
+        f"name: {skill['name']}\n"
+        f"category: {skill.get('category', 'other')}\n"
+        f"importance: {skill.get('importance')}\n"
+        f"</skill>"
+    )
 
 
 def clean_roadmap(raw, skill, priority):
@@ -75,6 +101,10 @@ def clean_roadmap(raw, skill, priority):
     if not isinstance(raw_steps, list):
         raise ValueError("Roadmap has no steps")
 
+    required_steps = _get_required_steps(
+        skill.get("importance")
+    )
+
     steps = []
 
     for item in raw_steps:
@@ -84,14 +114,13 @@ def clean_roadmap(raw, skill, priority):
         title = str(item.get("title", "")).strip()
 
         title = re.sub(
-            r"^\s*week\s+\d+\s*[:\-–]\s*",
+            r"^\s*(?:week|step)\s+\d+\s*[:\-–]\s*",
             "",
             title,
             flags=re.IGNORECASE,
         )
 
         title = title[:120]
-
         topics = _clean_topics(item.get("topics"))
 
         if not title or len(topics) < MIN_TOPICS:
@@ -103,11 +132,14 @@ def clean_roadmap(raw, skill, priority):
             "topics": topics,
         })
 
-        if len(steps) >= MAX_STEPS:
+        if len(steps) >= required_steps:
             break
 
-    if not steps:
-        raise ValueError("Roadmap has no valid steps")
+    if len(steps) < required_steps:
+        raise ValueError(
+            f"Roadmap has {len(steps)} valid steps; "
+            f"{required_steps} required"
+        )
 
     weeks = len(steps)
 
@@ -135,31 +167,11 @@ def clean_roadmap(raw, skill, priority):
 
 
 def _is_complete(roadmap):
-    steps = roadmap["steps"]
-    importance = roadmap["importance"]
-
-    minimum = (
-        4 if importance >= 0.8
-        else 3 if importance >= 0.5
-        else 2
+    required_steps = _get_required_steps(
+        roadmap["importance"]
     )
 
-    final_title = steps[-1]["title"].lower()
-
-    has_practical_final_step = any(
-        term in final_title
-        for term in (
-    "project",
-    "application",
-    "exercise",
-    "case study",
-    "task",
-    "simulation",
-    "implementation",
-)
-    )
-
-    return len(steps) >= minimum and has_practical_final_step
+    return len(roadmap["steps"]) == required_steps
 
 
 def generate_roadmap(
@@ -176,13 +188,32 @@ def generate_roadmap(
         other_missing_skills,
     )
 
-    for attempt in range(2):
-        raw = ask_llm_json(GENERATE_ROADMAP_PROMPT, message)
-        roadmap = clean_roadmap(raw, skill, priority)
+    last_error = None
 
-        if _is_complete(roadmap):
-            return roadmap
+    for attempt in range(2):
+        raw = ask_llm_json(
+            GENERATE_ROADMAP_PROMPT,
+            message,
+        )
+
+        try:
+            roadmap = clean_roadmap(
+                raw,
+                skill,
+                priority,
+            )
+
+            if _is_complete(roadmap):
+                return roadmap
+
+            last_error = ValueError(
+                "Incomplete roadmap response"
+            )
+
+        except ValueError as error:
+            last_error = error
 
     raise ValueError(
-        f"Incomplete roadmap generated for skill '{skill['name']}'"
-    )
+        f"Failed to generate a valid roadmap for skill "
+        f"'{skill['name']}' after 2 attempts"
+    ) from last_error
