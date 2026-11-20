@@ -267,15 +267,18 @@ Return exactly one score for each of the four dimensions.
 Each dimension must appear exactly once.
 
 
+
 4. DISCREPANCY FLAGS:
 
-- Identify only clear, direct, and evidence-based contradictions
-  between claims in the resume and statements made by the candidate
-  during the interview.
-- Compare statements that refer to the same skill, project,
-  responsibility, qualification, achievement, or experience.
-- A discrepancy must involve two claims that cannot reasonably
-  both be true in the same context.
+- Carefully compare the information in the resume with all statements made by the candidate in their original interview answers.
+- Actively look for inconsistencies and contradictions, even if they are expressed using different wording.
+- Check all relevant information, including education, GPA, work experience, job titles, dates, projects, responsibilities, technical skills, technologies, achievements, and years of experience.
+- Do not require an exact wording match to identify a contradiction. Understand the meaning and context of each claim before comparing them.
+- If the resume states one fact and the candidate gives a different or conflicting fact during the interview, report it.
+- Do not ignore a contradiction simply because it is not an obvious direct statement. Use the surrounding context to identify clear inconsistencies.
+- Do not treat information missing from the resume as a contradiction by itself.
+- Do not flag differences that can reasonably be explained by different contexts.
+- Do not infer dishonesty or intentional misrepresentation.
 
 EVIDENCE RULES:
 
@@ -293,7 +296,6 @@ EVIDENCE RULES:
   or level of detail as contradictions by themselves.
 - Do not infer dishonesty, exaggeration, or intentional
   misrepresentation.
-- Do not create a discrepancy based on uncertainty or speculation.
 - Do not flag a skill as a discrepancy merely because it appears
   in the resume but was not discussed or demonstrated during
   the interview.
